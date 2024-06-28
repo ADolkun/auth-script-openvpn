@@ -38,66 +38,159 @@ struct plugin_context
         const char *argv[];
 };
 
-/* Extract environment variables from envp */
-static const char* get_env(const char *name, const char *envp[]) {
-    if (envp) {
-        int i = 0;
-        const char *entry = NULL;
-        const size_t namelen = strlen(name);
-        while ((entry = envp[i++]) != NULL) {
-            if (strncmp(entry, name, namelen) == 0 && entry[namelen] == '=') {
-                return &entry[namelen + 1]; // Returns value after '='
-            }
-        }
-    }
-    return NULL;
-}
-
 /* Handle an authentication request */
-/* Modified deferred_handler function */
-static int deferred_handler(struct plugin_context *context, const char *envp[])
+static int deferred_handler(struct plugin_context *context, 
+                const char *envp[])
 {
-    plugin_log_t log = context->plugin_log;
-    pid_t pid;
+        plugin_log_t log = context->plugin_log;
+        pid_t pid;
 
-    /* Extract username and password from environment variables */
-    const char* username = get_env("username", envp);
-    const char* password = get_env("password", envp);
+        log(PLOG_DEBUG, PLUGIN_NAME, 
+                        "Deferred handler using script_path=%s", 
+                        context->argv[SCRIPT_NAME_IDX]);
 
-    if (!username || !password) {
-        log(PLOG_ERR, PLUGIN_NAME, "Username or password not provided");
-        return OPENVPN_PLUGIN_FUNC_ERROR;
-    }
+        pid = fork();
 
-    log(PLOG_DEBUG, PLUGIN_NAME, "Deferred handler using script_path=%s", context->argv[SCRIPT_NAME_IDX]);
-
-    /* Fork and handle the authentication script */
-    pid = fork();
-
-    if (pid < 0) { // Fork failed
-        log(PLOG_ERR, PLUGIN_NAME, "Fork failed with error code: %d", pid);
-        return OPENVPN_PLUGIN_FUNC_ERROR;
-    } else if (pid > 0) { // Parent process
-        int wstatus;
-        pid_t wait_rc = waitpid(pid, &wstatus, 0);
-        if (wait_rc < 0) {
-            log(PLOG_ERR, PLUGIN_NAME, "Wait failed for pid %d, waitpid got %d", pid, wait_rc);
-            return OPENVPN_PLUGIN_FUNC_ERROR;
+        /* Parent - child failed to fork */
+        if (pid < 0) {
+                log(PLOG_ERR, PLUGIN_NAME, 
+                                "pid failed < 0 check, got %d", pid);
+                return OPENVPN_PLUGIN_FUNC_ERROR;
         }
-        if (WIFEXITED(wstatus)) {
-            log(PLOG_DEBUG, PLUGIN_NAME, "Child exited with status %d", WEXITSTATUS(wstatus));
-            return WEXITSTATUS(wstatus);
-        }
-        log(PLOG_ERR, PLUGIN_NAME, "Child terminated abnormally");
-        return OPENVPN_PLUGIN_FUNC_ERROR;
-    } else { // Child process
-        /* Construct new argv with username and password */
-        char *new_argv[] = {context->argv[0], strdup(username), strdup(password), NULL};
 
-        /* Execute the authentication script with the new argv */
-        execve(context->argv[0], new_argv, (char *const *)envp);
-        exit(EXIT_FAILURE); // Should never reach here unless execve fails
-    }
+        /* Parent - child forked successfully 
+         *
+         * Here we wait until that child completes before notifying OpenVPN of
+         * our status.
+         */
+        if (pid > 0) {
+                pid_t wait_rc;
+                int wstatus;
+
+                log(PLOG_DEBUG, PLUGIN_NAME, "child pid is %d", pid);
+                
+                /* Block until the child returns */
+                wait_rc = waitpid(pid, &wstatus, 0);
+
+                /* Values less than 0 indicate no child existed */
+                if (wait_rc < 0) {
+                        log(PLOG_ERR, PLUGIN_NAME,
+                                        "wait failed for pid %d, waitpid got %d",
+                                        pid, wait_rc);
+                        return OPENVPN_PLUGIN_FUNC_ERROR;
+                }
+
+                /* WIFEXITED will be true if the child exited normally, any
+                 * other return indicates an abnormal termination.
+                 */
+                if (WIFEXITED(wstatus)) {
+                        log(PLOG_DEBUG, PLUGIN_NAME, 
+                                        "child pid %d exited with status %d", 
+                                        pid, WEXITSTATUS(wstatus));
+                        return WEXITSTATUS(wstatus);
+                }
+
+                log(PLOG_ERR, PLUGIN_NAME,
+                                "child pid %d terminated abnormally",
+                                pid);
+                return OPENVPN_PLUGIN_FUNC_ERROR;
+        }
+
+
+        /* Child Control - Spin off our sucessor */
+        pid = fork();
+
+        /* Notify our parent that our child faild to fork */
+        if (pid < 0) 
+                exit(OPENVPN_PLUGIN_FUNC_ERROR);
+        
+        /* Let our parent know that our child is working appropriately */
+        if (pid > 0)
+                exit(OPENVPN_PLUGIN_FUNC_DEFERRED);
+
+        /* Child Spawn - This process actually spawns the script */
+        
+        /* Daemonize */
+        umask(0);
+        setsid();
+
+        /* Close open files and move to root */
+        int chdir_rc = chdir("/");
+        if (chdir_rc < 0)
+                log(PLOG_DEBUG, PLUGIN_NAME,
+                                "Error trying to change pwd to \'/\'");
+        // close(STDIN_FILENO);
+        // close(STDOUT_FILENO);
+        // close(STDERR_FILENO);
+
+        int execve_rc = execve(context->argv[0], 
+                        (char *const*)context->argv, 
+                        (char *const*)envp);
+        if ( execve_rc == -1 ) {
+                switch(errno) {
+                        case E2BIG:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: E2BIG");
+                                break;
+                        case EACCES:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: EACCES");
+                                break;
+                        case EAGAIN:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: EAGAIN");
+                                break;
+                        case EFAULT:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: EFAULT");
+                                break;
+                        case EINTR:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: EINTR");
+                                break;
+                        case EINVAL:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: EINVAL");
+                                break;
+                        case ELOOP:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ELOOP");
+                                break;
+                        case ENAMETOOLONG:
+                                log(PLOG_DEBUG, PLUGIN_NAME,
+                                                "Error trying to exec: ENAMETOOLONG");
+                                break;
+                        case ENOENT:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ENOENT");
+                                break;
+                        case ENOEXEC:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ENOEXEC");
+                                break;
+                        case ENOLINK:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ENOLINK");
+                                break;
+                        case ENOMEM:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ENOMEM");
+                                break;
+                        case ENOTDIR:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ENOTDIR");
+                                break;
+                        case ETXTBSY:
+                                log(PLOG_DEBUG, PLUGIN_NAME, 
+                                                "Error trying to exec: ETXTBSY");
+                                break;
+                        default:
+                                log(PLOG_ERR, PLUGIN_NAME, 
+                                                "Error trying to exec: unknown, errno: %d", 
+                                                errno);
+                }
+        }
+        exit(EXIT_FAILURE);
 }
 
 /* We require OpenVPN Plugin API v3 */
